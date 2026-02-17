@@ -1,0 +1,43 @@
+server_name: "localhost"
+pid_file: /data/homeserver.pid
+public_baseurl: "http://localhost:8008/"
+
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    x_forwarded: false
+    bind_addresses: ['0.0.0.0']
+    resources:
+      - names: [client, federation]
+        compress: false
+
+database:
+  name: psycopg2
+  txn_limit: 10000
+  args:
+    user: postgres
+    password: "robrix-dev-password"
+    dbname: synapse
+    host: robrix-postgres
+    port: 5432
+    cp_min: 5
+    cp_max: 10
+
+log_config: "/data/log.config"
+media_store_path: "/data/media_store"
+max_upload_size: "50M"
+url_preview_enabled: false
+signing_key_path: "/data/localhost.signing.key"
+
+enable_registration: true
+enable_registration_without_verification: true
+report_stats: false
+
+macaroon_secret_key: "robrix-dev-macaroon-secret"
+form_secret: "robrix-dev-form-secret"
+registration_shared_secret: "robrix-dev-registration-secret"
+
+suppress_key_server_warning: true
+trusted_key_servers:
+  - server_name: "matrix.org"

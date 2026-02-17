@@ -1,9 +1,16 @@
-## Cargo generated directory
-/target
-## cargo-packager generated directory
-/dist
+## Rust (in app/ subfolder)
+app/target
+app/dist
 
+## .NET / Aspire
+aspire/**/bin/
+aspire/**/obj/
+aspire/**/*.user
+
+## IDE
 .vscode
 .DS_Store
-CLAUDE.md
+.idea
+
+## Secrets & local
 proxychains.conf
