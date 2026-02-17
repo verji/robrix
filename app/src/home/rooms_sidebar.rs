@@ -22,6 +22,7 @@ live_design! {
     use crate::home::search_messages::*;
     use crate::home::rooms_list::RoomsList;
     use crate::home::rooms_list_header::RoomsListHeader;
+    use crate::home::space_navigator::SpaceNavigator;
 
     pub RoomsSideBar = {{RoomsSideBar}}<AdaptiveView> {
         Desktop = <View> {
@@ -48,8 +49,15 @@ live_design! {
             <CachedWidget> {
                 rooms_list_header = <RoomsListHeader> {}
             }
-            <CachedWidget> {
-                rooms_list = <RoomsList> {}
+            <View> {
+                width: Fill, height: Fill
+                flow: Right, spacing: 0
+                <CachedWidget> {
+                    space_navigator = <SpaceNavigator> {}
+                }
+                <CachedWidget> {
+                    rooms_list = <RoomsList> {}
+                }
             }
         },
 

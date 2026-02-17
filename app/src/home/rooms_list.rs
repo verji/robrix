@@ -27,6 +27,7 @@ use crate::{
     home::{
         navigation_tab_bar::{NavigationBarAction, SelectedTab},
         space_lobby::{SpaceLobbyAction, SpaceLobbyEntryWidgetExt},
+        space_navigator::SpaceNavigatorAction,
     },
     room::{
         FetchedRoomAvatar,
@@ -39,7 +40,8 @@ use crate::{
         room_filter_input_bar::RoomFilterAction,
     },
     sliding_sync::{MatrixRequest, PaginationDirection, submit_async_request},
-    space_service_sync::{ParentChain, SpaceRequest, SpaceRoomListAction}, utils::RoomNameId,
+    space_service_sync::{ParentChain, SpaceRequest, SpaceRoomListAction, SubspaceDisplayInfo},
+    utils::RoomNameId,
 };
 use super::rooms_list_entry::RoomsListEntryAction;
 
@@ -47,6 +49,13 @@ use super::rooms_list_entry::RoomsListEntryAction;
 /// be able to display the latest message in a room's RoomsListEntry,
 /// and to have something to immediately show when a user first opens a room.
 const PREPAGINATE_VISIBLE_ROOMS: bool = true;
+
+/// Whether to show subspaces as navigable entries in the rooms list panel
+/// when a space is selected, and only display direct children of the current space.
+///
+/// When `false`, the existing behavior is preserved: rooms from nested subspaces
+/// are recursively flattened into a single list with no subspace entries shown.
+const SHOW_SUBSPACES_IN_ROOMS_LIST: bool = true;
 
 thread_local! {
     /// The list of all invited rooms, which is only tracked here
@@ -369,6 +378,8 @@ struct SpaceMapValue {
     direct_child_rooms: Arc<HashSet<OwnedRoomId>>,
     /// The nested subspaces (only spaces) that are direct children of this space.
     direct_subspaces: Arc<HashSet<OwnedRoomId>>,
+    /// Display info for each direct subspace within this space.
+    subspace_infos: Arc<Vec<SubspaceDisplayInfo>>,
     /// The chain of parents that this space has, ordered from highest to lowest level.
     ///
     /// That is, the first element is this space's top-level ancestor space,
@@ -435,6 +446,11 @@ pub struct RoomsList {
     #[rust] displayed_regular_rooms: Vec<OwnedRoomId>,
     #[rust(true)] is_regular_rooms_header_expanded: bool,
 
+    /// The currently-selected subspace within the Space Navigator.
+    /// When set, the rooms list filters to show only rooms that are
+    /// direct children of this subspace (instead of the top-level space).
+    #[rust] selected_subspace: Option<OwnedRoomId>,
+
     /// The latest status message that should be displayed in the bottom status label.
     #[rust] status: String,
 
@@ -469,8 +485,21 @@ macro_rules! should_display_room {
     ($self:expr, $room_id:expr, $room:expr) => {
         !$self.hidden_rooms.contains($room_id)
             && ($self.display_filter)($room)
-            && $self.selected_space.as_ref()
-                .is_none_or(|space| $self.is_room_indirectly_in_space(space.room_id(), $room_id))
+            && {
+                let effective_space_id = if SHOW_SUBSPACES_IN_ROOMS_LIST {
+                    $self.selected_subspace.as_ref()
+                        .or($self.selected_space.as_ref().map(|s| s.room_id()))
+                } else {
+                    $self.selected_space.as_ref().map(|s| s.room_id())
+                };
+                effective_space_id.is_none_or(|eff| {
+                    if SHOW_SUBSPACES_IN_ROOMS_LIST {
+                        $self.is_room_direct_child_of_space(eff, $room_id)
+                    } else {
+                        $self.is_room_indirectly_in_space(eff, $room_id)
+                    }
+                })
+            }
     };
 }
 
@@ -789,13 +818,17 @@ impl RoomsList {
             + self.displayed_direct_rooms.len()
             + self.displayed_regular_rooms.len();
 
-        let mut text = match (self.filter_keywords.is_empty(), num_rooms) {
-            (true, 0)  => "No joined rooms found".to_string(),
-            (true, 1)  => "Loaded 1 room".to_string(),
-            (true, n)  => format!("Loaded {n} rooms"),
-            (false, 0) => "No matching rooms found".to_string(),
-            (false, 1) => "Found 1 matching room".to_string(),
-            (false, n) => format!("Found {n} matching rooms"),
+        let mut text = if self.filter_keywords.is_empty() {
+            match num_rooms {
+                0 => "No joined rooms found".to_string(),
+                r => format!("Loaded {r} room{}", if r == 1 { "" } else { "s" }),
+            }
+        } else {
+            match num_rooms {
+                0 => "No matching rooms found".to_string(),
+                1 => "Found 1 matching room".to_string(),
+                n => format!("Found {n} matching rooms"),
+            }
         };
         match self.selected_space.is_some() {
             true => text.push_str(" in this space."),
@@ -893,15 +926,17 @@ impl RoomsList {
     /// 1. The indexes for the invited rooms,
     /// 2. The indexes for the direct rooms (DMs / People),
     /// 3. The indexes for the regular non-direct joined rooms.
-    fn calculate_indexes(&self) -> (RoomCategoryIndexes, RoomCategoryIndexes, RoomCategoryIndexes) {
-        // Based on the various displayed room lists and is_expanded state of each room header,
-        // calculate the indices in the PortalList where the headers and rooms should be drawn.
+    fn calculate_indexes(
+        &self,
+    ) -> (RoomCategoryIndexes, RoomCategoryIndexes, RoomCategoryIndexes) {
         let should_show_invited_rooms_header = !self.displayed_invited_rooms.is_empty();
         let should_show_direct_rooms_header = !self.displayed_direct_rooms.is_empty();
         let should_show_regular_rooms_header = !self.displayed_regular_rooms.is_empty();
 
-        let index_of_invited_rooms_header = should_show_invited_rooms_header.then_some(0);
-        let index_of_first_invited_room = should_show_invited_rooms_header as usize;
+        let index_of_invited_rooms_header = should_show_invited_rooms_header
+            .then_some(0);
+        let index_of_first_invited_room =
+            should_show_invited_rooms_header as usize;
         let index_after_invited_rooms = index_of_first_invited_room +
             if self.is_invited_rooms_header_expanded {
                 self.displayed_invited_rooms.len()
@@ -956,13 +991,16 @@ impl RoomsList {
     /// Handle any incoming updates to spaces' room lists and pagination state.
     fn handle_space_room_list_action(&mut self, cx: &mut Cx, action: &SpaceRoomListAction) {
         match action {
-            SpaceRoomListAction::UpdatedChildren { space_id, parent_chain, direct_child_rooms, direct_subspaces } => {
+            SpaceRoomListAction::UpdatedChildren {
+                space_id, parent_chain, direct_child_rooms, direct_subspaces, subspace_infos,
+            } => {
                 match self.space_map.entry(space_id.clone()) {
                     Entry::Occupied(mut occ) => {
                         let occ_mut = occ.get_mut();
                         occ_mut.parent_chain = parent_chain.clone();
                         occ_mut.direct_child_rooms = Arc::clone(direct_child_rooms);
                         occ_mut.direct_subspaces   = Arc::clone(direct_subspaces);
+                        occ_mut.subspace_infos     = Arc::clone(subspace_infos);
                     }
                     Entry::Vacant(vac) => {
                         vac.insert_entry(SpaceMapValue {
@@ -970,13 +1008,15 @@ impl RoomsList {
                             parent_chain: parent_chain.clone(),
                             direct_child_rooms: Arc::clone(direct_child_rooms),
                             direct_subspaces:   Arc::clone(direct_subspaces),
+                            subspace_infos:     Arc::clone(subspace_infos),
                         });
                     }
                 }
-                if self.selected_space.as_ref().is_some_and(|sel_space|
+                let affects_current = self.selected_space.as_ref().is_some_and(|sel_space|
                     sel_space.room_id() == space_id
                     || parent_chain.contains(sel_space.room_id())
-                ) {
+                ) || self.selected_subspace.as_ref().is_some_and(|sub| sub == space_id);
+                if affects_current {
                     self.update_displayed_rooms(cx);
                 }
             }
@@ -1037,6 +1077,13 @@ impl RoomsList {
             // DetailedChildren is handled by SpaceLobbyScreen, not RoomsList.
             SpaceRoomListAction::DetailedChildren { .. } => { }
         }
+    }
+
+    /// Returns whether the given target room is a direct child of the given space
+    /// (not recursing into subspaces).
+    fn is_room_direct_child_of_space(&self, space: &OwnedRoomId, target: &OwnedRoomId) -> bool {
+        self.space_map.get(space)
+            .is_some_and(|smv| smv.direct_child_rooms.contains(target))
     }
 
     /// Returns whether the given target room or space is indirectly within the given parent space.
@@ -1121,7 +1168,7 @@ impl Widget for RoomsList {
                         self.is_direct_rooms_header_expanded =
                             !self.is_direct_rooms_header_expanded;
                     }
-                    _todo => todo!("Handle other header categories"),
+                    _other => { }
                 }
                 self.redraw(cx);
             }
@@ -1139,10 +1186,13 @@ impl Widget for RoomsList {
                 if let Some(NavigationBarAction::TabSelected(tab)) = action.downcast_ref() {
                     match tab {
                         SelectedTab::Space { space_name_id } => {
-                            if self.selected_space.as_ref().is_some_and(|s| s.room_id() == space_name_id.room_id()) {
+                            if self.selected_space.as_ref().is_some_and(|s| s.room_id() == space_name_id.room_id())
+                                && self.selected_subspace.is_none()
+                            {
                                 continue;
                             }
 
+                            self.selected_subspace = None;
                             self.selected_space = Some(space_name_id.clone());
                             self.view.space_lobby_entry(ids!(space_lobby_entry)).set_visible(cx, true);
 
@@ -1179,10 +1229,20 @@ impl Widget for RoomsList {
                         }
                         _ => {
                             self.selected_space = None;
+                            self.selected_subspace = None;
                             self.view.space_lobby_entry(ids!(space_lobby_entry)).set_visible(cx, false);
                         }
                     }
 
+                    self.update_displayed_rooms(cx);
+                    continue;
+                }
+
+                // Handle subspace selection from the Space Navigator.
+                if let SpaceNavigatorAction::SubspaceSelected { subspace_id }
+                    = action.as_widget_action().cast()
+                {
+                    self.selected_subspace = subspace_id;
                     self.update_displayed_rooms(cx);
                     continue;
                 }
@@ -1404,6 +1464,13 @@ impl RoomsListRef {
     /// to the background space service.
     pub fn get_space_request_sender(&self) -> Option<UnboundedSender<SpaceRequest>> {
         self.borrow()?.space_request_sender.clone()
+    }
+
+    /// Returns the subspace display infos for a given space.
+    pub fn get_subspace_infos(&self, space_id: &OwnedRoomId) -> Vec<SubspaceDisplayInfo> {
+        self.borrow()
+            .and_then(|inner| inner.space_map.get(space_id).map(|smv| smv.subspace_infos.as_ref().clone()))
+            .unwrap_or_default()
     }
 
     /// Returns the parent chain of the given space, if known.

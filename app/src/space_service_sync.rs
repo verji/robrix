@@ -21,6 +21,16 @@ const LOG_SPACE_SERVICE_DIFFS: bool = cfg!(feature = "log_space_service_diffs");
 /// while the last element is the direct parent.
 pub type ParentChain = SmallVec<[OwnedRoomId; 2]>;
 
+/// Display info for a subspace within a parent space,
+/// used to show subspace entries in the rooms list panel.
+#[derive(Clone, Debug)]
+pub struct SubspaceDisplayInfo {
+    pub room_id: OwnedRoomId,
+    pub display_name: String,
+    pub num_joined_members: u64,
+    pub children_count: u64,
+}
+
 
 /// Requests related to obtaining info about Spaces, via the background space service.
 pub enum SpaceRequest {
@@ -596,6 +606,7 @@ async fn space_room_list_loop(
                         parent_chain: parent_chain.clone(),
                         direct_child_rooms: Arc::clone(&cached_hash_sets.0),
                         direct_subspaces: Arc::clone(&cached_hash_sets.1),
+                        subspace_infos: Arc::clone(&cached_hash_sets.2),
                     });
                 }
                 SpaceRoomListRequest::GetDetailedChildren => {
@@ -650,6 +661,7 @@ async fn space_room_list_loop(
                 parent_chain: parent_chain.clone(),
                 direct_child_rooms: Arc::clone(&cached_hash_sets.0),
                 direct_subspaces: Arc::clone(&cached_hash_sets.1),
+                subspace_infos: Arc::clone(&cached_hash_sets.2),
             });
         }
     } }
@@ -685,22 +697,34 @@ fn handle_subspaces<'a>(
     }
 }
 
-/// Returns two HashSets of all direct children within a space:
+/// The return type of [`space_children_to_hash_sets`]:
+/// `(direct_child_rooms, direct_subspaces, subspace_display_infos)`.
+type SpaceChildrenSets = (Arc<HashSet<OwnedRoomId>>, Arc<HashSet<OwnedRoomId>>, Arc<Vec<SubspaceDisplayInfo>>);
+
+/// Returns the direct children within a space as:
 /// 1. the set of child rooms directly within this space.
 /// 2. the set of subspaces directly within this space.
+/// 3. display info for each subspace (for showing in the rooms list).
 fn space_children_to_hash_sets(
     all_rooms_in_space: &Vector<SpaceRoom>
-) -> (Arc<HashSet<OwnedRoomId>>, Arc<HashSet<OwnedRoomId>>) {
+) -> SpaceChildrenSets {
     let mut direct_child_rooms = HashSet::new();
     let mut direct_subspaces = HashSet::new();
+    let mut subspace_infos = Vec::new();
     for sr in all_rooms_in_space.iter() {
         if sr.is_space() {
             direct_subspaces.insert(sr.room_id.clone());
+            subspace_infos.push(SubspaceDisplayInfo {
+                room_id: sr.room_id.clone(),
+                display_name: sr.display_name.clone(),
+                num_joined_members: sr.num_joined_members,
+                children_count: sr.children_count,
+            });
         } else {
             direct_child_rooms.insert(sr.room_id.clone());
         }
     }
-    (Arc::new(direct_child_rooms), Arc::new(direct_subspaces))
+    (Arc::new(direct_child_rooms), Arc::new(direct_subspaces), Arc::new(subspace_infos))
 }
 
 /// Actions emitted from the SpaceRoomList for a given space.
@@ -716,6 +740,8 @@ pub enum SpaceRoomListAction {
         direct_child_rooms: Arc<HashSet<OwnedRoomId>>,
         /// The nested subspaces (only spaces) directly within this space.
         direct_subspaces: Arc<HashSet<OwnedRoomId>>,
+        /// Display info for each direct subspace within this space.
+        subspace_infos: Arc<Vec<SubspaceDisplayInfo>>,
     },
     /// The state of the background pagination process that was fetching the list
     /// of rooms in the given space has changed.
@@ -742,7 +768,7 @@ pub enum SpaceRoomListAction {
 impl std::fmt::Debug for SpaceRoomListAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            SpaceRoomListAction::UpdatedChildren { space_id, parent_chain, direct_child_rooms, direct_subspaces } => {
+            SpaceRoomListAction::UpdatedChildren { space_id, parent_chain, direct_child_rooms, direct_subspaces, .. } => {
                 f.debug_struct("SpaceRoomListAction::UpdatedChildren")
                     .field("space_id", space_id)
                     .field("parent_chain", &parent_chain)

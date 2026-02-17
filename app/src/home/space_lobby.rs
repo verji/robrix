@@ -516,6 +516,16 @@ pub struct TreeLines {
     #[walk] walk: Walk,
 }
 
+impl TreeLines {
+    /// Set the tree line rendering parameters.
+    pub fn set_properties(&mut self, level: f32, is_last: f32, parent_mask: f32, indent_width: f32) {
+        self.draw_bg.level = level;
+        self.draw_bg.is_last = is_last;
+        self.draw_bg.parent_mask = parent_mask;
+        self.draw_bg.indent_width = indent_width;
+    }
+}
+
 impl Widget for TreeLines {
     fn handle_event(&mut self, _cx: &mut Cx, _event: &Event, _scope: &mut Scope) { }
 
@@ -523,7 +533,7 @@ impl Widget for TreeLines {
         let indent_pixel = (self.draw_bg.level + 1.0) * self.draw_bg.indent_width;
         let mut walk = walk;
         walk.width = Size::Fixed(indent_pixel as f64);
-        
+
         self.draw_bg.draw_walk(cx, walk);
         DrawStep::done()
     }
@@ -798,10 +808,12 @@ impl Widget for SpaceLobbyScreen {
                             avatar_ref.show_text(cx, None, None, first_char.unwrap_or("#"));
 
                             if let Some(mut lines) = item.widget(ids!(tree_lines)).borrow_mut::<TreeLines>() {
-                                lines.draw_bg.level = *level as f32;
-                                lines.draw_bg.is_last = if *is_last { 1.0 } else { 0.0 };
-                                lines.draw_bg.parent_mask = *parent_mask as f32;
-                                lines.draw_bg.indent_width = 44.0; // Hardcoded to match
+                                lines.set_properties(
+                                    *level as f32,
+                                    if *is_last { 1.0 } else { 0.0 },
+                                    *parent_mask as f32,
+                                    44.0,
+                                );
                             }
 
                             let info_label = item.label(ids!(content.info_label));
@@ -833,10 +845,12 @@ impl Widget for SpaceLobbyScreen {
                             let item = list.item(cx, item_id, id!(subspace_loading));
                             // Configure tree lines
                             if let Some(mut lines) = item.widget(ids!(tree_lines)).borrow_mut::<TreeLines>() {
-                                lines.draw_bg.level = *level as f32;
-                                lines.draw_bg.is_last = 1.0; 
-                                lines.draw_bg.parent_mask = *parent_mask as f32;
-                                lines.draw_bg.indent_width = 44.0;
+                                lines.set_properties(
+                                    *level as f32,
+                                    1.0,
+                                    *parent_mask as f32,
+                                    44.0,
+                                );
                             }
                             item
                         }

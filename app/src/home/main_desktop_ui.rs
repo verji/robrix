@@ -31,7 +31,7 @@ live_design! {
 
             root = Splitter {
                 axis: Horizontal,
-                align: FromA(300.0),
+                align: FromA(420.0),
                 a: rooms_sidebar_tab,
                 b: main
             }
