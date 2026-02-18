@@ -184,7 +184,7 @@ live_design! {
     // A view that draws the hierarchical tree structure lines.
     DrawTreeLine = {{DrawTreeLine}} { }
 
-    TreeLines = {{TreeLines}} {
+    pub TreeLines = {{TreeLines}} {
         width: 0, height: Fill
         draw_bg: {
             indent_width: 44.0
