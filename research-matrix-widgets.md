@@ -629,16 +629,18 @@ There are two categories of implementation:
 
 ### PoC: Show Web Content in Robrix (Windows + CEF)
 
+**Status:** Complete (branch `taj/minimal-widget-poc`)
+
 **Goal:** A minimal proof-of-concept that loads a webpage and renders it as a texture inside
 a Makepad widget in Robrix, on Windows. No Matrix Widget API, no postMessage, no input
 forwarding — just: "can we see a webpage inside Robrix?"
 
 #### What "Success" Looks Like
 
-When you run Robrix, a new panel (or test widget) appears somewhere in the UI that shows a
-live-rendered webpage (e.g., `https://example.com`). It's displayed as an image texture that
-CEF keeps updating. You can't interact with it yet (no clicks or keyboard) — that's a
-follow-up step.
+The PoC replaces the welcome/home panel with a full-panel `WebViewWidget` that renders
+`https://wid.staging.verji.app/` via CEF. The browser renders at the widget's actual pixel
+dimensions (dynamically resized) and the content is displayed as a GPU texture. No
+interaction (clicks/keyboard) — that's a follow-up step.
 
 #### Which CEF Crate?
 
@@ -672,25 +674,33 @@ Here's what happens when the PoC runs, step by step:
                        │
                        ▼
   ┌─────────────────────────────────────────────────────────┐
-  │ 2. Create an offscreen browser pointing at a URL        │
-  │    - "Load https://example.com"                         │
+  │ 2. WebViewWidget detects its layout size                 │
+  │    - Reports actual pixel dimensions via set_desired_size│
+  │    - CefManager picks up the size on next poll()         │
+  └────────────────────┬────────────────────────────────────┘
+                       │
+                       ▼
+  ┌─────────────────────────────────────────────────────────┐
+  │ 3. Create an offscreen browser at the widget's size      │
+  │    - Loads the configured URL (e.g. wid.staging.verji)  │
   │    - Browser is invisible — no window, just memory      │
-  │    - Size: e.g. 800x600 pixels                          │
+  │    - Resizes dynamically when widget size changes        │
   └────────────────────┬────────────────────────────────────┘
                        │
                        ▼
   ┌─────────────────────────────────────────────────────────┐
-  │ 3. CEF renders the page and calls on_frame()            │
-  │    - Delivers BGRA8 pixel buffer (800 * 600 * 4 bytes)  │
+  │ 4. CEF renders the page and calls on_frame()            │
+  │    - Delivers BGRA8 pixel buffer (W * H * 4 bytes)      │
   │    - Called every time the page content changes          │
-  │    - We stash these pixels and notify Makepad            │
+  │    - Pixels stashed in a global Mutex, Makepad signalled │
   └────────────────────┬────────────────────────────────────┘
                        │
                        ▼
   ┌─────────────────────────────────────────────────────────┐
-  │ 4. Makepad widget receives the pixels                   │
+  │ 5. Makepad widget receives the pixels                   │
   │    - Swaps them into a VecBGRAu8_32 texture             │
-  │    - Draws the texture in a widget area                  │
+  │    - Recreates texture if frame dimensions changed       │
+  │    - Draws the texture via shader in the widget area     │
   │    - User sees the webpage inside Robrix!                │
   └─────────────────────────────────────────────────────────┘
 ```
@@ -718,161 +728,145 @@ That's it — one line. wew handles the rest internally.
 
 **B. The CEF manager** (initialization + lifecycle)
 
-This is a Rust module that starts up CEF once when Robrix launches and shuts it down on exit.
-It owns the CEF runtime and message loop.
+File: `app/src/webview/cef_manager.rs`
+
+This module starts up CEF when Robrix launches and owns the runtime and message loop.
+It also handles dynamic resize: the widget reports its layout size via global atomics
+(`DESIRED_WIDTH`/`DESIRED_HEIGHT`), and `poll()` calls `webview.resize()` when they change.
 
 Responsibilities:
-- Call `MessagePumpLoop::default()` to create CEF's message loop in "pump" mode (so we
-  control when it runs, rather than CEF blocking our thread)
+- Create CEF's message loop in "pump" mode (`MessagePumpLoop`) so Robrix controls polling
 - Create the CEF runtime with settings (cache path, log level, path to helper exe)
-- Provide a `poll()` method that Robrix calls from its main event loop to drive CEF
-- Create offscreen browser instances on demand
-- Shut down cleanly when Robrix exits
+- Provide a `poll()` method called from Makepad's event loop to drive CEF
+- Create the offscreen browser once CEF signals readiness (via `CEF_INITIALIZED` flag)
+- Resize the browser when the widget's layout size changes
 
-Key detail: CEF's `poll()` must be called on the **main thread** — the same thread that
-runs Makepad's event loop. This is fine because Makepad's event loop already runs on the
-main thread. We'd call `cef_manager.poll()` inside Makepad's event handling.
+Frame delivery uses a global `Mutex<Option<FrameData>>` (`LATEST_FRAME`) — CEF's
+`on_frame` callback writes to it, the widget reads from it. `SignalToUI::set_ui_signal()`
+wakes Makepad after each frame or when CEF needs pump work.
 
-```
-File: app/src/webview/cef_manager.rs
+```rust
+// Actual implementation (simplified):
+pub struct CefManager {
+    message_loop: MessagePumpLoop,
+    runtime: Runtime<MessagePumpLoop, WindowlessRenderWebView>,
+    webview: Option<WebView<WindowlessRenderWebView>>,
+    browser_url: String,
+    browser_width: u32,
+    browser_height: u32,
+}
 
-Pseudocode:
-    struct CefManager {
-        message_loop: MessagePumpLoop,
-        runtime: Runtime,
+impl CefManager {
+    pub fn new(url: &str, width: u32, height: u32) -> Result<Self, wew::Error> { ... }
+
+    pub fn poll(&mut self) {
+        self.message_loop.poll();
+        // Create browser once CEF is initialized
+        if self.webview.is_none() && CEF_INITIALIZED.load(Ordering::Acquire) {
+            // Use desired size from widget if available
+            self.create_browser();
+        }
+        // Resize browser if widget reported a new size
+        if let Some(webview) = &self.webview {
+            let (dw, dh) = (DESIRED_WIDTH.load(..), DESIRED_HEIGHT.load(..));
+            if dw != self.browser_width || dh != self.browser_height {
+                webview.resize(dw, dh);
+            }
+        }
     }
-
-    impl CefManager {
-        fn new() -> Self {
-            let message_loop = MessagePumpLoop::default();
-            let builder = message_loop
-                .create_runtime_attributes_builder::<WindowlessRenderWebView>()
-                .with_browser_subprocess_path("./robrix-cef-helper.exe")
-                .with_root_cache_path(cache_dir)
-                .with_log_severity(LogLevel::Info);
-            let runtime = builder.build().create_runtime(handler).unwrap();
-            Self { message_loop, runtime }
-        }
-
-        fn create_browser(&self, url: &str, width: u32, height: u32) -> WebView {
-            self.runtime.create_webview(url, attrs, frame_handler).unwrap()
-        }
-
-        fn poll(&self) {
-            self.message_loop.poll();
-        }
-    }
+}
 ```
 
 **C. The frame receiver** (CEF → pixel buffer → Makepad)
 
-This is the callback that CEF calls every time it has new pixels. It needs to be thread-safe
-because CEF may call it from a background thread, while Makepad textures can only be updated
-from the main thread.
+This is the `WebViewObserver` callback that CEF calls every time it has new pixels. It writes
+to a global `Mutex<Option<FrameData>>` and wakes Makepad via `SignalToUI::set_ui_signal()`.
 
-The flow:
-1. CEF calls `on_frame()` with a `Frame` containing BGRA8 pixel data
-2. We copy the pixels into a `Vec<u32>` (repacking BGRA bytes into packed u32)
-3. We call `Cx::post_action()` to send the pixels to the main thread
-4. Makepad's main thread picks up the action and updates the texture
+The original plan used `Cx::post_action()` but the actual implementation uses a simpler
+global mutex approach — CEF writes, the widget reads on the next event cycle.
 
-```
-Pseudocode:
+```rust
+// Actual implementation:
+impl WindowlessRenderWebViewHandler for WebViewObserver {
+    fn on_frame(&self, frame: &Frame) {
+        if !matches!(frame.ty, FrameType::View) { return; }
 
-    impl WindowlessRenderWebViewHandler for FrameHandler {
-        fn on_frame(&self, frame: &Frame) {
-            // frame.buffer is &[u8] in BGRA8 format
-            // frame.width, frame.height are the dimensions
-            // Repack bytes → Vec<u32> for Makepad's VecBGRAu8_32 format
-            let pixels: Vec<u32> = frame.buffer
-                .chunks_exact(4)
-                .map(|bgra| {
-                    // Makepad expects: (A << 24) | (R << 16) | (G << 8) | B
-                    // CEF gives:       B, G, R, A  (bytes in order)
-                    let b = bgra[0] as u32;
-                    let g = bgra[1] as u32;
-                    let r = bgra[2] as u32;
-                    let a = bgra[3] as u32;
-                    (a << 24) | (r << 16) | (g << 8) | b
-                })
-                .collect();
+        // CEF delivers BGRA8 bytes. On little-endian, from_ne_bytes gives
+        // exactly the layout Makepad's VecBGRAu8_32 expects.
+        let pixels: Vec<u32> = frame.buffer
+            .chunks_exact(4)
+            .map(|c| u32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
 
-            // Send to main thread
-            Cx::post_action(CefFrameReady {
-                pixels,
-                width: frame.width,
-                height: frame.height,
-            });
+        if let Ok(mut latest) = LATEST_FRAME.lock() {
+            *latest = Some(FrameData { pixels, width: frame.width, height: frame.height });
         }
+        SignalToUI::set_ui_signal();
     }
+}
 ```
 
 **D. The Makepad widget** (`WebViewWidget`)
 
-A new Makepad widget that displays the texture. Follows the standard Robrix widget pattern:
-`live_design!` macro + struct with `#[derive(Live, LiveHook, Widget)]` + `Widget` trait impl.
+File: `app/src/shared/web_view_widget.rs`
 
-```
-File: app/src/shared/web_view_widget.rs
+A Makepad widget that displays CEF frames as a GPU texture. It detects its own layout size
+after `draw_walk` and reports it to CEF via `set_desired_size()`. On each event cycle it
+checks for new frames and updates the texture.
 
-Pseudocode:
+Key implementation details:
+- Tracks texture dimensions (`tex_width`/`tex_height`) separately from widget dimensions
+  to avoid garbled rendering when sizes change during resize
+- Only uses `swap_vec_u32` when frame dimensions match the texture exactly; recreates the
+  texture otherwise
+- Uses `self.view.area().rect(cx)` after `draw_walk` to detect actual layout size
 
-    live_design! {
-        use link::theme::*;
-        use link::widgets::*;
-
-        pub WebViewWidget = {{WebViewWidget}} {
-            width: Fill,
-            height: 400,
-            show_bg: true,
-            draw_bg: {
-                texture image: texture2d
-                fn pixel(self) -> vec4 {
-                    return sample2d(self.image, self.pos).xyzw;
-                }
+```rust
+// Actual implementation (simplified):
+live_design! {
+    pub WebViewWidget = {{WebViewWidget}} {
+        width: Fill, height: Fill,
+        show_bg: true,
+        draw_bg: {
+            texture tex: texture2d
+            fn pixel(self) -> vec4 {
+                return sample2d(self.tex, self.pos).xyzw;
             }
         }
     }
+}
 
-    #[derive(Live, LiveHook, Widget)]
-    pub struct WebViewWidget {
-        #[deref] view: View,
-        #[rust] texture: Option<Texture>,
-    }
+#[derive(Live, LiveHook, Widget)]
+pub struct WebViewWidget {
+    #[deref] view: View,
+    #[rust] texture: Option<Texture>,
+    #[rust] tex_width: usize,   // track texture dimensions
+    #[rust] tex_height: usize,  // separately from widget size
+    #[rust] last_widget_width: u32,
+    #[rust] last_widget_height: u32,
+}
 
-    impl Widget for WebViewWidget {
-        fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
-            // Check for new frames from CEF
-            if let Event::Actions(actions) = event {
-                for action in actions {
-                    if let Some(frame) = action.downcast_ref::<CefFrameReady>() {
-                        // Create texture on first frame, or update existing
-                        let texture = self.texture.get_or_insert_with(|| {
-                            Texture::new_with_format(cx, TextureFormat::VecBGRAu8_32 {
-                                width: frame.width as usize,
-                                height: frame.height as usize,
-                                data: Some(frame.pixels.clone()),
-                                updated: TextureUpdated::Full,
-                            })
-                        });
-
-                        // On subsequent frames, swap in new pixel data
-                        texture.swap_vec_u32(cx, &mut frame.pixels.clone());
-
-                        // Bind texture to shader and redraw
-                        self.view.draw_bg.draw_vars.set_texture(0, texture);
-                        self.redraw(cx);
-                    }
-                }
-            }
-
-            self.view.handle_event(cx, event, scope);
-        }
-
-        fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
-            self.view.draw_walk(cx, scope, walk)
+impl Widget for WebViewWidget {
+    fn handle_event(&mut self, cx: &mut Cx, event: &Event, scope: &mut Scope) {
+        self.view.handle_event(cx, event, scope);
+        if let Some(frame) = crate::webview::take_latest_frame() {
+            self.update_texture(cx, frame);
         }
     }
+
+    fn draw_walk(&mut self, cx: &mut Cx2d, scope: &mut Scope, walk: Walk) -> DrawStep {
+        let result = self.view.draw_walk(cx, scope, walk);
+        // Report actual layout size to CEF for dynamic resize
+        let rect = self.view.area().rect(cx);
+        let (w, h) = (rect.size.x as u32, rect.size.y as u32);
+        if w > 0 && h > 0 && (w != self.last_widget_width || h != self.last_widget_height) {
+            self.last_widget_width = w;
+            self.last_widget_height = h;
+            crate::webview::set_desired_size(w, h);
+        }
+        result
+    }
+}
 ```
 
 #### How It Fits Into the Robrix Codebase
@@ -894,32 +888,57 @@ app/
 ```
 
 Changes to existing files:
-- `app/Cargo.toml` — add `wew = { git = "..." }` dependency
-- `app/src/lib.rs` — add `mod webview;`
-- `app/src/shared/mod.rs` — add `pub mod web_view_widget;` and register in `live_design()`
-- `app/src/app.rs` — initialize `CefManager` on startup, call `cef_manager.poll()` in the
-  event loop, add `WebViewWidget` somewhere in the UI layout (e.g., a test panel)
+- `app/Cargo.toml` — added `wew = { git = "https://github.com/mycrl/wew" }` + `[[bin]]` for helper
+- `app/src/lib.rs` — added `pub mod webview;`
+- `app/src/shared/mod.rs` — added `pub mod web_view_widget;` and registered in `live_design()`
+- `app/src/app.rs` — added `CefManager` field, init on startup, `poll()` on every event cycle
+- `app/src/home/welcome_screen.rs` — replaced welcome text with full-panel `WebViewWidget`
+
+#### Build Prerequisites (Windows)
+
+The `wew` crate's build script compiles CEF's C++ wrapper and generates Rust bindings,
+which requires:
+
+- **LLVM/Clang** — `winget install LLVM.LLVM` then set `LIBCLANG_PATH="C:/Program Files/LLVM/bin"`
+- **CMake** — `winget install Kitware.CMake` and add to PATH
+
+First build takes ~9 minutes (downloads CEF, compiles C++ wrapper, builds all deps).
+Incremental rebuilds (Rust-only changes) take ~3 minutes.
 
 #### CEF Runtime Files (Post-Build Step)
 
 After `cargo build`, CEF's DLLs and resources need to be copied next to the Robrix binary.
-wew downloads them during build, but they end up in the build directory. You need a script
-(or manual copy) to place them alongside `robrix.exe`:
+wew downloads them during build into the build output directory. Copy them alongside
+`robrix.exe`:
 
+```bash
+# Source: app/target/release/build/wew-<hash>/out/cef/
+CEF_DIR="app/target/release/build/wew-*/out/cef"
+
+# Copy Release DLLs + data files
+cp $CEF_DIR/Release/*.dll app/target/release/
+cp $CEF_DIR/Release/v8_context_snapshot.bin app/target/release/
+cp $CEF_DIR/Release/vk_swiftshader_icd.json app/target/release/
+
+# Copy Resources
+cp $CEF_DIR/Resources/icudtl.dat app/target/release/
+cp $CEF_DIR/Resources/resources.pak app/target/release/
+cp $CEF_DIR/Resources/chrome_*.pak app/target/release/
+mkdir -p app/target/release/locales
+cp $CEF_DIR/Resources/locales/*.pak app/target/release/locales/
 ```
-target/release/ (or debug/)
+
+Result:
+```
+app/target/release/
 ├── robrix.exe
 ├── robrix-cef-helper.exe
-├── libcef.dll                (~200 MB)
-├── chrome_elf.dll
-├── d3dcompiler_47.dll
-├── v8_context_snapshot.bin
-├── icudtl.dat
-├── resources.pak
-├── chrome_100_percent.pak
-├── chrome_200_percent.pak
+├── libcef.dll, chrome_elf.dll, d3dcompiler_47.dll, dxil.dll,
+│   dxcompiler.dll, libEGL.dll, libGLESv2.dll, vk_swiftshader.dll, vulkan-1.dll
+├── v8_context_snapshot.bin, vk_swiftshader_icd.json
+├── icudtl.dat, resources.pak, chrome_100_percent.pak, chrome_200_percent.pak
 └── locales/
-    └── en-US.pak  (+ other locales)
+    └── en-US.pak  (+ 54 other locales)
 ```
 
 #### CEF Event Loop Integration
@@ -944,8 +963,8 @@ looping.
 
 #### What This PoC Does NOT Include (Follow-Up Steps)
 
-This PoC only proves that we can get CEF pixels onto a Makepad texture. The following would
-come in subsequent iterations:
+This PoC proves that we can get CEF pixels onto a Makepad texture with dynamic resize.
+The following would come in subsequent iterations:
 
 1. **Mouse/keyboard input forwarding** — intercept `Hit::FingerDown/Move/Up/Scroll` and
    `Hit::KeyDown/TextInput` in the widget and forward to CEF via `webview.mouse()` /
@@ -958,7 +977,9 @@ come in subsequent iterations:
 4. **matrix-rust-sdk WidgetDriver integration** — wire up `WidgetDriverHandle::send()`/`recv()`
    to the JS bridge.
 5. **Widget lifecycle** — creating/destroying browser instances as widgets open/close.
-6. **Resize handling** — when the Makepad widget changes size, call `webview.resize()`.
+
+**Completed in the PoC:**
+- ~~Resize handling~~ — `webview.resize()` is called dynamically when the widget size changes.
 
 ---
 
