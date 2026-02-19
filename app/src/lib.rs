@@ -38,6 +38,9 @@ pub mod tsp;
 pub mod tsp_dummy;
 
 
+/// CEF-based webview embedding for Matrix widget support.
+pub mod webview;
+
 // Matrix stuff
 pub mod sliding_sync;
 pub mod space_service_sync;

@@ -19,6 +19,7 @@ pub mod unread_badge;
 pub mod verification_badge;
 pub mod restore_status_view;
 pub mod image_viewer;
+pub mod web_view_widget;
 
 
 pub fn live_design(cx: &mut Cx) {
@@ -42,4 +43,5 @@ pub fn live_design(cx: &mut Cx) {
     restore_status_view::live_design(cx);
     confirmation_modal::live_design(cx);
     image_viewer::live_design(cx);
+    web_view_widget::live_design(cx);
 }

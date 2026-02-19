@@ -17,6 +17,7 @@ metadata.makepad-auto-version = "zqpv-Yj-K7WNVK2I8h5Okhho46Q="
 
 [dependencies]
 makepad-widgets = { git = "https://github.com/kevinaboos/makepad", branch = "serde_optional", features = ["serde"] }
+wew = { git = "https://github.com/mycrl/wew" }
 # makepad-widgets = { git = "https://github.com/makepad/makepad", branch = "dev", features = ["serde"] }
 
 ## Including this crate automatically configures all `robius-*` crates to work with Makepad.
@@ -234,6 +235,10 @@ appdata_paths = [
     "$APPDATA/$PUBLISHER/$PRODUCTNAME",
     "$LOCALAPPDATA/$PRODUCTNAME",
 ]
+
+[[bin]]
+name = "robrix-cef-helper"
+path = "src/bin/robrix_cef_helper.rs"
 
 [lints.rust]
 keyword_idents_2024 = "forbid"
