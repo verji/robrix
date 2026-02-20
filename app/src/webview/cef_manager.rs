@@ -1,11 +1,12 @@
 use std::sync::{
     Mutex,
-    atomic::{AtomicBool, AtomicU32, Ordering},
+    atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering},
 };
 
 use makepad_widgets::SignalToUI;
 use wew::{
     MessageLoopAbstract, MessagePumpLoop, WindowlessRenderWebView,
+    events::{MouseButton, MouseEvent, Position},
     runtime::{LogLevel, MessagePumpRuntimeHandler, Runtime, RuntimeHandler},
     webview::{
         Frame, FrameType, WebView, WebViewAttributesBuilder, WebViewHandler,
@@ -22,6 +23,10 @@ static LATEST_FRAME: Mutex<Option<FrameData>> = Mutex::new(None);
 /// Desired browser size, set by the widget when it detects its layout size.
 static DESIRED_WIDTH: AtomicU32 = AtomicU32::new(0);
 static DESIRED_HEIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Pending click coordinates. `i32::MIN` means no click is pending.
+static PENDING_CLICK_X: AtomicI32 = AtomicI32::new(i32::MIN);
+static PENDING_CLICK_Y: AtomicI32 = AtomicI32::new(i32::MIN);
 
 /// Raw frame data rendered by CEF.
 pub struct FrameData {
@@ -41,6 +46,12 @@ pub fn set_desired_size(width: u32, height: u32) {
     DESIRED_HEIGHT.store(height, Ordering::Relaxed);
 }
 
+/// Request a mouse click at the given coordinates (dispatched on next poll).
+pub fn request_click(x: i32, y: i32) {
+    PENDING_CLICK_X.store(x, Ordering::Relaxed);
+    PENDING_CLICK_Y.store(y, Ordering::Relaxed);
+}
+
 /// Manages the CEF runtime lifecycle: initialization, browser creation, and polling.
 pub struct CefManager {
     message_loop: MessagePumpLoop,
@@ -49,6 +60,8 @@ pub struct CefManager {
     browser_url: String,
     browser_width: u32,
     browser_height: u32,
+    browser_created_at: Option<std::time::Instant>,
+    auto_click_fired: bool,
 }
 
 impl CefManager {
@@ -75,6 +88,8 @@ impl CefManager {
             browser_url: url.to_string(),
             browser_width: width,
             browser_height: height,
+            browser_created_at: None,
+            auto_click_fired: false,
         })
     }
 
@@ -93,6 +108,7 @@ impl CefManager {
                 self.browser_height = dh;
             }
             self.create_browser();
+            self.browser_created_at = Some(std::time::Instant::now());
         }
 
         // If the widget reported a new size, resize the browser.
@@ -104,6 +120,43 @@ impl CefManager {
                 self.browser_height = dh;
                 webview.resize(dw, dh);
             }
+        }
+
+        // Dispatch any pending click requested via `request_click()`.
+        let cx = PENDING_CLICK_X.load(Ordering::Relaxed);
+        let cy = PENDING_CLICK_Y.load(Ordering::Relaxed);
+        if cx != i32::MIN && cy != i32::MIN {
+            self.send_click(cx, cy);
+            PENDING_CLICK_X.store(i32::MIN, Ordering::Relaxed);
+            PENDING_CLICK_Y.store(i32::MIN, Ordering::Relaxed);
+        }
+
+        // Auto-click the center of the widget after a delay to start video playback.
+        if !self.auto_click_fired {
+            if let Some(created_at) = self.browser_created_at {
+                if created_at.elapsed() > std::time::Duration::from_secs(3) {
+                    let cx = (self.browser_width / 2) as i32;
+                    let cy = (self.browser_height / 2) as i32;
+                    self.send_click(cx, cy);
+                    self.auto_click_fired = true;
+                    makepad_widgets::log!(
+                        "CEF: Auto-click sent at ({}, {}) to start video", cx, cy
+                    );
+                }
+            }
+        }
+    }
+
+    /// Send a mouse click (move + down + up) at the given position.
+    fn send_click(&self, x: i32, y: i32) {
+        if let Some(webview) = &self.webview {
+            let pos = Some(Position { x, y });
+            // Move cursor to the target position first (so hover state is correct).
+            webview.mouse(&MouseEvent::Move(Position { x, y }));
+            // Mouse down.
+            webview.mouse(&MouseEvent::Click(MouseButton::Left, true, pos));
+            // Mouse up.
+            webview.mouse(&MouseEvent::Click(MouseButton::Left, false, pos));
         }
     }
 
@@ -146,6 +199,67 @@ impl CefManager {
         std::fs::create_dir_all(&dir).ok();
         dir.to_string_lossy().into_owned()
     }
+
+    /// Write a test HTML page to disk and return its `file://` URL.
+    ///
+    /// Using `file://` instead of `data:` so the page can fetch external
+    /// resources (video files) without origin restrictions.
+    pub fn write_video_test_page() -> String {
+        let dir = crate::app_data_dir().join("cef_cache");
+        std::fs::create_dir_all(&dir).ok();
+        let path = dir.join("video_test.html");
+
+        let html = r#"<!DOCTYPE html>
+<html>
+<head>
+<style>
+  body { margin: 0; background: #000; overflow: hidden; }
+  video { width: 100vw; height: 100vh; object-fit: contain; display: block; }
+  #status { position: fixed; top: 10px; left: 10px; color: lime;
+            font: 16px monospace; z-index: 10; }
+</style>
+</head>
+<body>
+<div id="status">Loading video...</div>
+<video id="v" autoplay muted playsinline loop>
+  <source src="https://www.w3schools.com/html/mov_bbb.mp4" type="video/mp4">
+  <source src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.webm" type="video/webm">
+</video>
+<script>
+var s = document.getElementById('status');
+var v = document.getElementById('v');
+
+v.onloadstart  = function() { s.textContent = 'Video loading...'; };
+v.oncanplay    = function() { s.textContent = 'Can play, starting...';
+                               v.play().catch(function(e) {
+                                 s.textContent = 'Play error: ' + e.message;
+                               }); };
+v.onplaying    = function() { s.textContent = 'Playing!';
+                               setTimeout(function() { s.style.display = 'none'; }, 2000); };
+v.onwaiting    = function() { s.textContent = 'Buffering...'; };
+v.onstalled    = function() { s.textContent = 'Stalled...'; };
+v.onerror      = function() { s.textContent = 'Error: ' +
+                               (v.error ? v.error.message : 'unknown'); };
+
+// Fallback: retry play after 2s if still paused.
+setTimeout(function() {
+  if (v.paused) {
+    s.textContent = 'Retrying play()...';
+    v.play().catch(function(e) {
+      s.textContent = 'Retry failed: ' + e.message;
+    });
+  }
+}, 2000);
+</script>
+</body>
+</html>"#;
+
+        std::fs::write(&path, html).expect("Failed to write video test HTML");
+
+        // Convert to a file:// URL (forward slashes, no UNC prefix).
+        let canon = path.to_string_lossy().replace('\\', "/");
+        format!("file:///{}", canon.trim_start_matches('/'))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +288,15 @@ impl MessagePumpRuntimeHandler for RuntimeObserver {
 
 struct WebViewObserver;
 
-impl WebViewHandler for WebViewObserver {}
+impl WebViewHandler for WebViewObserver {
+    fn on_state_change(&self, state: wew::webview::WebViewState) {
+        makepad_widgets::log!("CEF: WebView state changed to {:?}", state);
+    }
+
+    fn on_title_change(&self, title: &str) {
+        makepad_widgets::log!("CEF: Page title changed to: {}", title);
+    }
+}
 
 impl WindowlessRenderWebViewHandler for WebViewObserver {
     fn on_frame(&self, frame: &Frame) {
