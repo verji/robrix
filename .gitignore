@@ -12,5 +12,14 @@ aspire/**/*.user
 .DS_Store
 .idea
 
+## Claude Code
+.claude/
+
+## Visual Studio
+*.sln
+
+## Build artifacts (root-level)
+target/
+
 ## Secrets & local
 proxychains.conf
