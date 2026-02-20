@@ -166,6 +166,8 @@ pub struct App {
     /// This can be either a room we're waiting to join, or one we're waiting to be invited to.
     /// Also includes an optional room ID to be closed once the awaited room has been loaded.
     #[rust] waiting_to_navigate_to_room: Option<(BasicRoomDetails, Option<OwnedRoomId>)>,
+    /// CEF webview manager for the widget PoC.
+    #[rust] cef_manager: Option<crate::webview::CefManager>,
 }
 
 impl LiveRegister for App {
@@ -230,6 +232,17 @@ impl MatchEvent for App {
         }
 
         self.update_login_visibility(cx);
+
+        // Initialize CEF for the webview PoC.
+        match crate::webview::CefManager::new("https://wid.staging.verji.app/", 800, 600) {
+            Ok(cef) => {
+                log!("App::Startup: CEF manager initialized successfully.");
+                self.cef_manager = Some(cef);
+            }
+            Err(e) => {
+                error!("App::Startup: Failed to initialize CEF: {:?}", e);
+            }
+        }
 
         log!("App::Startup: starting matrix sdk loop");
         let _tokio_rt_handle = crate::sliding_sync::start_matrix_tokio().unwrap();
@@ -491,6 +504,11 @@ fn clear_all_app_state(cx: &mut Cx) {
 
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
+        // Drive CEF's message loop on every event cycle.
+        if let Some(cef) = &mut self.cef_manager {
+            cef.poll();
+        }
+
         if let Event::Shutdown = event {
             let window_ref = self.ui.window(ids!(main_window));
             if let Err(e) = persistence::save_window_state(window_ref, cx) {
