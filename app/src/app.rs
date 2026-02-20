@@ -233,8 +233,11 @@ impl MatchEvent for App {
 
         self.update_login_visibility(cx);
 
-        // Initialize CEF for the webview PoC.
-        match crate::webview::CefManager::new("https://wid.staging.verji.app/", 800, 600) {
+        // Initialize CEF for the webview PoC — write a test HTML page to disk and
+        // load it via file:// so it can fetch the external video without origin restrictions.
+        let video_test_url = crate::webview::CefManager::write_video_test_page();
+        log!("App::Startup: CEF video test page: {}", video_test_url);
+        match crate::webview::CefManager::new(&video_test_url, 800, 600) {
             Ok(cef) => {
                 log!("App::Startup: CEF manager initialized successfully.");
                 self.cef_manager = Some(cef);
