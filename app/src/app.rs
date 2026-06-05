@@ -166,8 +166,6 @@ pub struct App {
     /// This can be either a room we're waiting to join, or one we're waiting to be invited to.
     /// Also includes an optional room ID to be closed once the awaited room has been loaded.
     #[rust] waiting_to_navigate_to_room: Option<(BasicRoomDetails, Option<OwnedRoomId>)>,
-    /// CEF webview manager for the widget PoC.
-    #[rust] cef_manager: Option<crate::webview::CefManager>,
 }
 
 impl LiveRegister for App {
@@ -233,17 +231,18 @@ impl MatchEvent for App {
 
         self.update_login_visibility(cx);
 
-        // Initialize CEF for the webview PoC — write a test HTML page to disk and
-        // load it via file:// so it can fetch the external video without origin restrictions.
-        let video_test_url = crate::webview::CefManager::write_video_test_page();
-        log!("App::Startup: CEF video test page: {}", video_test_url);
-        match crate::webview::CefManager::new(&video_test_url, 800, 600) {
-            Ok(cef) => {
-                log!("App::Startup: CEF manager initialized successfully.");
-                self.cef_manager = Some(cef);
-            }
-            Err(e) => {
-                error!("App::Startup: Failed to initialize CEF: {:?}", e);
+        // Initialize the CEF overlay backend (native child window approach).
+        #[cfg(target_os = "windows")]
+        {
+            // Test page: WebRTC capability check + simple video playback.
+            let test_url = crate::webview::overlay_backend::write_webrtc_test_page();
+            match crate::webview::overlay_backend::init(&test_url) {
+                Ok(()) => {
+                    log!("App::Startup: Overlay backend initialized successfully.");
+                }
+                Err(e) => {
+                    error!("App::Startup: Failed to initialize overlay backend: {:?}", e);
+                }
             }
         }
 
@@ -507,10 +506,9 @@ fn clear_all_app_state(cx: &mut Cx) {
 
 impl AppMain for App {
     fn handle_event(&mut self, cx: &mut Cx, event: &Event) {
-        // Drive CEF's message loop on every event cycle.
-        if let Some(cef) = &mut self.cef_manager {
-            cef.poll();
-        }
+        // Drive the CEF overlay backend's message loop on every event cycle.
+        #[cfg(target_os = "windows")]
+        crate::webview::overlay_backend::poll();
 
         if let Event::Shutdown = event {
             let window_ref = self.ui.window(ids!(main_window));

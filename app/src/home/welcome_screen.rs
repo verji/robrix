@@ -5,13 +5,13 @@ live_design! {
     use link::shaders::*;
     use link::widgets::*;
 
-    use crate::shared::web_view_widget::WebViewWidget;
+    use crate::shared::web_view_overlay::WebViewOverlay;
 
     pub WelcomeScreen = <View> {
         width: Fill, height: Fill
 
-        // PoC: CEF-rendered web content filling the welcome panel.
-        web_view = <WebViewWidget> {
+        // PoC: CEF native overlay window filling the welcome panel.
+        web_view = <WebViewOverlay> {
             width: Fill, height: Fill,
         }
     }

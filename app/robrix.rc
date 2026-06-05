@@ -1,0 +1,3 @@
+// Embed the Windows application manifest (required for CEF GPU process).
+// 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID, 24 = RT_MANIFEST
+1 24 "robrix.manifest"
