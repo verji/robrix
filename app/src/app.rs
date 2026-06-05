@@ -250,6 +250,21 @@ impl MatchEvent for App {
         log!("App::Startup: starting matrix sdk loop");
         let _tokio_rt_handle = crate::sliding_sync::start_matrix_tokio().unwrap();
 
+        // Spawn async video download + local HTTP file server for playback.
+        _tokio_rt_handle.spawn(async {
+            let url = "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4";
+            match crate::webview::download_video(url, Some(158_008_374)).await {
+                Ok(path) => {
+                    makepad_widgets::log!("Video downloaded to {:?}", path);
+                    // Start a local HTTP server to serve the video with range request support.
+                    if let Err(e) = crate::webview::start_file_server(path).await {
+                        makepad_widgets::error!("File server failed: {}", e);
+                    }
+                }
+                Err(e) => makepad_widgets::error!("Video download failed: {}", e),
+            }
+        });
+
         #[cfg(feature = "tsp")] {
             log!("App::Startup: initializing TSP (Trust Spanning Protocol) module.");
             crate::tsp::tsp_init(_tokio_rt_handle).unwrap();

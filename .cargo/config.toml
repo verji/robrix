@@ -1,3 +1,8 @@
+## Share the target directory with the main repo to reuse cached build
+## artifacts (notably the ~1GB CEF SDK downloaded by the wew crate).
+[build]
+target-dir = "C:/dev/src/robrix/app/target"
+
 ## Add these flags onto all target builds cumulatively.
 ## <https://github.com/rust-lang/cargo/issues/5376#issuecomment-2163350032>
 [target.'cfg(all())']
